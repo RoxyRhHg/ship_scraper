@@ -119,8 +119,8 @@ class Config:
     batch_size: int = 100
     review_interval: int = 100
     max_stall_retries: int = 5         # v10: 2→5
-    proxy: str = "auto"
-    proxy_domains: tuple[str, ...] = ("bing.com", "usni.org", "wikimedia.org", "photos.usni.org")
+    proxy: str = ""                     # ""=直连(默认), 需代理时指定如 http://127.0.0.1:7890
+    proxy_domains: tuple[str, ...] = ()  # v10.2: 默认全部直连
     gpu_ocr: bool = True
     discovery_workers: int = 4
     mq_fetch_workers: int = 6          # MQ Phase 2 并行度 (直连)
@@ -1421,11 +1421,8 @@ class ShipScraperV10:
         self.dedup = DedupManager(self.workspace_root, self.output_dir)
 
         # Session 池: 直连池和代理池分开
-        self._resolved_proxy = ""
-        if config.proxy == "auto":
-            self._resolved_proxy = auto_detect_proxy()
-        elif config.proxy:
-            self._resolved_proxy = config.proxy
+        # v10.2: 默认全部直连, 仅当用户显式指定 --proxy 时才用代理
+        self._resolved_proxy = config.proxy if config.proxy else ""
 
         # 直连池: MQ, NavSource (无代理, 较高并发)
         self.direct_pool = SessionPool(proxy_url="", pool_size=config.direct_workers + 2)
@@ -1542,10 +1539,10 @@ class ShipScraperV10:
     # ── 并行候选发现 ─────────────────────────────────────────────────
 
     def _get_pool_for_source(self, name: str) -> SessionPool:
-        """直连源用 direct_pool, 代理源用 proxy_pool"""
-        if name in ("maritimequest", "navsource"):
-            return self.direct_pool
-        return self.proxy_pool
+        """v10.2: 全部源走直连. proxy_pool 仅在用户显式指定 --proxy 时用于 Wikimedia."""
+        if self._resolved_proxy and name == "wikimedia":
+            return self.proxy_pool
+        return self.direct_pool
 
     def _discover_all(self) -> list[CandidateImage]:
         all_cands: list[CandidateImage] = []
@@ -1674,9 +1671,8 @@ class ShipScraperV10:
         # 下载 (指数退避重试)
         for attempt in range(3):
             try:
-                # 选择合适的 session 池
-                pool = self._get_pool_for_source(cand.source)
-                s = pool.get()
+                # v10.2: 下载始终走直连, 不走代理
+                s = self.direct_pool.get()
                 resp = s.get(cand.image_url, timeout=config.request_timeout, stream=False)
                 resp.raise_for_status()
                 ct = resp.headers.get("Content-Type", "").lower()
