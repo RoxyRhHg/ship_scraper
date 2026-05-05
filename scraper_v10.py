@@ -1454,15 +1454,15 @@ class ShipScraperV10:
         self.accepted_rows: list[dict] = []
         self.accepted_image_urls: set[str] = set()
         self.accepted_page_counts: dict[str, int] = defaultdict(int)  # v10: 同页计数
-        self._load_state()
-
         self.rejection_counts: dict[str, int] = defaultdict(int)
         self.ocr_stats = {"ocr_passed": 0, "ocr_failed": 0, "metadata_fast_path": 0}
+        self.failed_urls: set[str] = set()
+        self._load_state()  # 必须在 failed_urls/rejection_counts 初始化之后调用
+
         self.batch_stats_history: list[dict] = []
         self.lock = Lock()
         self.start_time: float = 0.0
         self.last_review_accepted: int = 0
-        self.failed_urls: set[str] = set()
         self.stall_retry_counts: dict[str, int] = defaultdict(int)
         self.candidate_status: dict[str, str] = {}
 
