@@ -111,16 +111,19 @@ class Config:
     min_ocr_digits: int = 1
     max_ocr_chars: int = 15
     request_timeout: int = 30
+    max_download_mb: int = 25
     min_file_size: int = 10 * 1024
     seed: int = 42
     sources: tuple[str, ...] = ("bing", "usni", "navsource", "maritimequest", "wikimedia")
     max_per_source: int = 10000
     time_limit: int = 28800            # 8小时, 0=无限制
     batch_size: int = 100
+    max_batches: int = 0
     review_interval: int = 100
     max_stall_retries: int = 5         # v10: 2→5
     proxy: str = ""                     # ""=直连(默认), 需代理时指定如 http://127.0.0.1:7890
     proxy_domains: tuple[str, ...] = ()  # v10.2: 默认全部直连
+    trust_env_proxy: bool = True
     gpu_ocr: bool = True
     discovery_workers: int = 4
     mq_fetch_workers: int = 6          # MQ Phase 2 并行度 (直连)
@@ -367,6 +370,7 @@ def batch_ocr_check(image_paths: list[Path], min_digits: int = 1, max_chars: int
         if digit_count < min_digits or alnum_count > max_chars:
             results.append((False, cleaned, max_conf))
         else:
+            pass
             results.append((True, cleaned, max_conf))
 
     return results
@@ -498,44 +502,50 @@ class DedupManager:
 # ═══════════════════════════════════════════════════════════════════════
 
 class SessionPool:
-    """每 worker 一个独立 Session, 消除连接池竞态."""
+    """每 worker 独立 Session, 真正消除连接池竞态.
+    v10.4: 使用 threading.local 保证每个线程拥有独立 Session,
+    增大连接池, 启用 adapter 层重试 (3次, 指数退避).
+    """
 
-    def __init__(self, proxy_url: str = "", pool_size: int = 8):
+    def __init__(self, proxy_url: str = "", pool_size: int = 8, trust_env: bool = True):
         self.proxy_url = proxy_url
-        self._sessions: list[requests.Session] = []
-        self._lock = threading.Lock()
-        self._idx = 0
-        for _ in range(pool_size):
-            self._sessions.append(self._make_session())
+        self.trust_env = trust_env
+        self._local = threading.local()
 
     def _make_session(self) -> requests.Session:
         s = requests.Session()
         s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "image/*,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
         })
+        s.trust_env = self.trust_env
         if self.proxy_url:
             s.proxies = {"http": self.proxy_url, "https": self.proxy_url}
-        # 小连接池, 避免代理压力
+        # v10.4: 增大连接池 + 3次自动重试(指数退避)
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=2, pool_maxsize=4, max_retries=1,
+            pool_connections=4, pool_maxsize=8,
+            max_retries=requests.adapters.Retry(
+                total=3, backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "HEAD"],
+            ),
         )
         s.mount("https://", adapter)
         s.mount("http://", adapter)
         return s
 
     def get(self) -> requests.Session:
-        with self._lock:
-            s = self._sessions[self._idx % len(self._sessions)]
-            self._idx += 1
-            return s
+        """每线程一个 Session, 真正的 per-worker 隔离."""
+        if not hasattr(self._local, "session"):
+            self._local.session = self._make_session()
+        return self._local.session
 
     def close_all(self):
-        for s in self._sessions:
-            try:
-                s.close()
-            except Exception:
-                pass
+        """清理所有线程的 session (尽力而为)."""
+        pass  # threading.local sessions are GC'd with threads
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1422,12 +1432,21 @@ class ShipScraperV10:
 
         # Session 池: 直连池和代理池分开
         # v10.2: 默认全部直连, 仅当用户显式指定 --proxy 时才用代理
-        self._resolved_proxy = config.proxy if config.proxy else ""
+        raw_proxy = config.proxy if config.proxy else ""
+        if raw_proxy.lower() == "auto":
+            raw_proxy = auto_detect_proxy()
+        self._resolved_proxy = raw_proxy
 
         # 直连池: MQ, NavSource (无代理, 较高并发)
-        self.direct_pool = SessionPool(proxy_url="", pool_size=config.direct_workers + 2)
+        self.direct_pool = SessionPool(
+            proxy_url="", pool_size=config.direct_workers + 2,
+            trust_env=config.trust_env_proxy,
+        )
         # 代理池: Bing, USNI, Wiki (经代理, 低并发)
-        self.proxy_pool = SessionPool(proxy_url=self._resolved_proxy, pool_size=config.proxy_workers + 2)
+        self.proxy_pool = SessionPool(
+            proxy_url=self._resolved_proxy, pool_size=config.proxy_workers + 2,
+            trust_env=config.trust_env_proxy,
+        )
 
         self.accepted_sha1: set[str] = set()
         self.accepted_dhash: set[str] = set()
@@ -1481,6 +1500,9 @@ class ShipScraperV10:
                 self.ocr_stats = defaultdict(int, state.get("ocr_stats", {}))
                 pg = state.get("accepted_page_counts", {})
                 self.accepted_page_counts = defaultdict(int, pg)
+                # v10.3: 加载失败URL, 避免重复尝试死链
+                for u in state.get("failed_urls", []):
+                    self.failed_urls.add(u)
                 print(f"[State] Loaded state from {state_path}")
             except Exception as e:
                 print(f"[State] Error loading state: {e}")
@@ -1528,6 +1550,7 @@ class ShipScraperV10:
             "rejection_counts": dict(self.rejection_counts),
             "ocr_stats": dict(self.ocr_stats),
             "accepted_page_counts": dict(self.accepted_page_counts),
+            "failed_urls": sorted(self.failed_urls),
             "last_save": datetime.now().isoformat(),
         }
         state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1538,9 +1561,18 @@ class ShipScraperV10:
 
     # ── 并行候选发现 ─────────────────────────────────────────────────
 
+    def _reject_download_failure(self, image_url: str, exc: Exception):
+        err_type = type(exc).__name__
+        with self.lock:
+            reason_key = f"download_failed_{err_type}"
+            self.rejection_counts[reason_key] = self.rejection_counts.get(reason_key, 0) + 1
+            self.failed_urls.add(image_url)
+        self._reject("download_failed")
+
     def _get_pool_for_source(self, name: str) -> SessionPool:
-        """v10.2: 全部源走直连. proxy_pool 仅在用户显式指定 --proxy 时用于 Wikimedia."""
-        if self._resolved_proxy and name == "wikimedia":
+        """v10.4: 国际源(Bing/USNI/Wiki)走代理池, 静态站(MQ/NavSource)走直连池.
+        无代理时全部直连."""
+        if self._resolved_proxy and name in ("bing", "usni", "wikimedia"):
             return self.proxy_pool
         return self.direct_pool
 
@@ -1585,12 +1617,9 @@ class ShipScraperV10:
                     try:
                         src_name, cands = future.result()
                         all_cands.extend(cands)
-                        if src_name in ("bing", "usni") and len(all_cands) >= self.config.batch_size * 5:
-                            print(f"\n[Discovery] {len(all_cands)} fast candidates, short-circuiting...")
-                            for f in pending_sources:
-                                f.cancel()
-                            pending_sources.clear()
-                            break
+                        # v10.3: 移除短接 — bing/usni候选虽多但重复率高,
+                        # maritimequest/wikimedia/navsource 才是高价值低重复来源
+                        # 不再因为bing返回500+就cancel其他源
                     except Exception as e:
                         print(f"  Discovery worker error: {e}")
                 if not done:
@@ -1668,25 +1697,37 @@ class ShipScraperV10:
                 self._reject("per_page_limit")
                 return None, None
 
-        # 下载 (指数退避重试)
-        for attempt in range(3):
+        # 下载 (指数退避重试) — v10.4: 增大超时, 图片下载走源对应池
+        pool = self._get_pool_for_source(cand.source)
+        for attempt in range(4):
             try:
-                # v10.2: 下载始终走直连, 不走代理
-                s = self.direct_pool.get()
-                resp = s.get(cand.image_url, timeout=config.request_timeout, stream=False)
-                resp.raise_for_status()
-                ct = resp.headers.get("Content-Type", "").lower()
-                if ct and not ct.startswith("image/"):
-                    self._reject("non_image_content_type")
-                    return None, None
-                tmp_path.write_bytes(resp.content)
+                s = pool.get()
+                headers = {"Referer": cand.page_url} if cand.page_url else None
+                timeout = (15, 60)  # v10.4: connect=15s, read=60s (原 10/30)
+                with s.get(cand.image_url, timeout=timeout, stream=True, headers=headers) as resp:
+                    resp.raise_for_status()
+                    ct = resp.headers.get("Content-Type", "").lower()
+                    if ct and not ct.startswith("image/"):
+                        self.failed_urls.add(cand.image_url)
+                        self._reject("non_image_content_type")
+                        return None, None
+                    max_bytes = config.max_download_mb * 1024 * 1024
+                    total = 0
+                    with tmp_path.open("wb") as f:
+                        for chunk in resp.iter_content(chunk_size=64 * 1024):
+                            if not chunk:
+                                continue
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise ValueError("image_too_large")
+                            f.write(chunk)
                 break
-            except Exception:
+            except Exception as e:
                 safe_unlink(tmp_path)
-                if attempt == 2:
-                    self._reject("download_failed")
+                if attempt == 3:
+                    self._reject_download_failure(cand.image_url, e)
                     return None, None
-                time.sleep(1 * (attempt + 1))
+                time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, 4.5s
 
         if not tmp_path.exists():
             return None, None
@@ -1760,6 +1801,9 @@ class ShipScraperV10:
 
         batch_idx = 0
         while current < target and pending:
+            if config.max_batches > 0 and batch_idx >= config.max_batches:
+                print(f"\n[Batch limit: {config.max_batches}] Stopping.")
+                break
             if config.time_limit > 0 and (time.time() - self.start_time) > config.time_limit:
                 print(f"\n[Time limit: {config.time_limit}s] Stopping.")
                 break
@@ -1788,70 +1832,46 @@ class ShipScraperV10:
                 tmp, meta = self._download_and_prefilter(cand)
                 return cand, tmp, meta
 
-            # 混合并发: 直连6 + 代理4 = 总共最多10
-            # v10.1: 用 wait(timeout) 替代 as_completed, 防止 hung future 永久阻塞
+            # v10.4: per-future 超时 + 渐进式取消, 不再整批 wait
             all_futures: dict[Future, CandidateImage] = {}
-            with ThreadPoolExecutor(max_workers=config.direct_workers + config.proxy_workers) as dl_exec:
+            dl_exec = ThreadPoolExecutor(max_workers=config.direct_workers + config.proxy_workers)
+            try:
                 for cand in batch:
                     future = dl_exec.submit(download_worker, cand)
                     all_futures[future] = cand
 
-                pending_dl: set[Future] = set(all_futures.keys())
-                stall_count = 0
-                while pending_dl:
-                    if current + len(prefiltered) + len(self.accepted_rows) - accepted_before >= target:
-                        for f in pending_dl:
-                            f.cancel()
-                        break
-
-                    done, still_pending = wait(pending_dl, timeout=60)
-
-                    if not done and still_pending:
-                        # Hung futures detected — resubmit, don't block forever
-                        hung = len(still_pending)
-                        requeued = 0
-                        for f in list(still_pending):
-                            cand = all_futures[f]
-                            self.stall_retry_counts[cand.image_url] += 1
-                            if self.stall_retry_counts[cand.image_url] <= config.max_stall_retries:
-                                new_f = dl_exec.submit(download_worker, cand)
-                                all_futures[new_f] = cand
-                                requeued += 1
-                            else:
-                                self.failed_urls.add(cand.image_url)
-                            f.cancel()
-                            still_pending.discard(f)
-                        stall_count += 1
-                        print(f"  [Stall] {hung} inflight hung. Requeued {requeued}, "
-                              f"exhausted: {hung - requeued}. Stall count: {stall_count}")
-                        if stall_count >= 5:
-                            print(f"  [Stall] Too many stalls ({stall_count}), breaking batch {batch_idx}")
-                            for f in still_pending:
+                # v10.4: 用 as_completed 逐个检查, 全局超时=300s
+                for future in as_completed(all_futures, timeout=300):
+                    if current + len(prefiltered) >= target:
+                        for f in all_futures:
+                            if not f.done():
                                 f.cancel()
-                            break
-                        pending_dl = still_pending  # will be empty since we discarded all
+                        break
+                    try:
+                        cand_result, tmp, meta = future.result(timeout=5)
+                    except Exception as e:
+                        cand_result = all_futures[future]
+                        self._reject_download_failure(cand_result.image_url, e)
                         continue
 
-                    for future in done:
-                        try:
-                            cand_result, tmp, meta = future.result(timeout=5)
-                        except Exception:
-                            cand_result = all_futures[future]
-                            self.stall_retry_counts[cand_result.image_url] += 1
-                            if self.stall_retry_counts[cand_result.image_url] <= config.max_stall_retries:
-                                new_f = dl_exec.submit(download_worker, cand_result)
-                                all_futures[new_f] = cand_result
-                            else:
-                                self.failed_urls.add(cand_result.image_url)
-                            continue
-
-                        if tmp is not None and meta is not None:
-                            with download_lock:
-                                prefiltered.append((tmp, meta))
-                                if len(prefiltered) % 20 == 0:
-                                    print(f"  ... prefiltered {len(prefiltered)} in batch {batch_idx}")
-
-                    pending_dl = still_pending
+                    if tmp is not None and meta is not None:
+                        with download_lock:
+                            prefiltered.append((tmp, meta))
+                            if len(prefiltered) % 20 == 0:
+                                print(f"  ... prefiltered {len(prefiltered)} in batch {batch_idx}")
+            except Exception as _timeout_err:
+                if "futures unfinished" not in str(_timeout_err):
+                    raise
+                hung = sum(1 for f in all_futures if not f.done())
+                if hung > 0:
+                    print(f"  [Stall] {hung} futures still pending after 300s. Cancelling.")
+                    for f in all_futures:
+                        if not f.done():
+                            cand = all_futures[f]
+                            self.failed_urls.add(cand.image_url)
+                            f.cancel()
+            finally:
+                dl_exec.shutdown(wait=False, cancel_futures=True)
 
             print(f"  Batch {batch_idx}: {len(prefiltered)} passed prefilter (from {len(batch)} candidates)")
 
@@ -2261,7 +2281,13 @@ Examples:
     parser.add_argument("--min-ocr-digits", type=int, default=1)
     parser.add_argument("--max-ocr-chars", type=int, default=15)
     parser.add_argument("--sharpness", type=float, default=60.0)
+    parser.add_argument("--request-timeout", type=int, default=30,
+                        help="Per-read request timeout in seconds (default: 30)")
+    parser.add_argument("--max-download-mb", type=int, default=25,
+                        help="Skip images larger than this size in MB (default: 25)")
     parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--max-batches", type=int, default=0,
+                        help="Stop after this many download batches (0=unlimited)")
     parser.add_argument("--review-interval", type=int, default=100)
     parser.add_argument("--ocr-batch-size", type=int, default=6,
                         help="easyocr batch inference size (default: 6)")
@@ -2286,12 +2312,16 @@ Examples:
         min_ocr_digits=args.min_ocr_digits,
         max_ocr_chars=args.max_ocr_chars,
         sharpness_threshold=args.sharpness,
+        request_timeout=args.request_timeout,
+        max_download_mb=args.max_download_mb,
         sources=tuple(s.strip() for s in args.sources.split(",")),
         batch_size=args.batch_size,
+        max_batches=args.max_batches,
         review_interval=args.review_interval,
         ocr_batch_size=args.ocr_batch_size,
         per_page_limit=args.per_page_limit,
         proxy="" if args.no_proxy else args.proxy,
+        trust_env_proxy=not args.no_proxy,
         gpu_ocr=not args.no_gpu,
         discovery_workers=args.discovery_workers,
         mq_fetch_workers=args.mq_fetch_workers,
