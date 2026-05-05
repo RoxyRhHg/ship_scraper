@@ -49,6 +49,7 @@ import socket
 import warnings
 import requests
 from bs4 import BeautifulSoup
+from urllib3.util.timeout import Timeout
 
 warnings.filterwarnings("ignore", message="Palette images with Transparency")
 socket.setdefaulttimeout(30)
@@ -1570,9 +1571,9 @@ class ShipScraperV10:
         self._reject("download_failed")
 
     def _get_pool_for_source(self, name: str) -> SessionPool:
-        """v10.4: 国际源(Bing/USNI/Wiki)走代理池, 静态站(MQ/NavSource)走直连池.
-        无代理时全部直连."""
-        if self._resolved_proxy and name in ("bing", "usni", "wikimedia"):
+        """v10.5: Bing/USNI/Wiki/NavSource 走代理池, MQ 走直连池.
+        NavSource 在国内网络下直连被墙, 必须走代理."""
+        if self._resolved_proxy and name in ("bing", "usni", "wikimedia", "navsource"):
             return self.proxy_pool
         return self.direct_pool
 
@@ -1703,7 +1704,7 @@ class ShipScraperV10:
             try:
                 s = pool.get()
                 headers = {"Referer": cand.page_url} if cand.page_url else None
-                timeout = (15, 60)  # v10.4: connect=15s, read=60s (原 10/30)
+                timeout = Timeout(connect=15, read=30, total=90)  # v10.5: total 硬上限, 防慢连接卡死
                 with s.get(cand.image_url, timeout=timeout, stream=True, headers=headers) as resp:
                     resp.raise_for_status()
                     ct = resp.headers.get("Content-Type", "").lower()
@@ -1820,10 +1821,9 @@ class ShipScraperV10:
             print(f"{'─'*50}")
 
             # ── Phase A: 并行下载 + 非OCR过滤 ─────
-            # v10: 根据源类型动态选择并发数
-            # 把候选分为直连和代理两类, 分别控制并发
-            direct_batch = [c for c in batch if c.source in ("maritimequest", "navsource")]
-            proxy_batch = [c for c in batch if c.source not in ("maritimequest", "navsource")]
+            # v10.5: 直连池和代理池完全隔离, 代理 hang 不影响直连下载
+            direct_batch = [c for c in batch if c.source in ("maritimequest",)]
+            proxy_batch = [c for c in batch if c.source not in ("maritimequest",)]
 
             prefiltered: list[tuple[Path, dict]] = []
             download_lock = Lock()
@@ -1832,15 +1832,18 @@ class ShipScraperV10:
                 tmp, meta = self._download_and_prefilter(cand)
                 return cand, tmp, meta
 
-            # v10.4: per-future 超时 + 渐进式取消, 不再整批 wait
             all_futures: dict[Future, CandidateImage] = {}
-            dl_exec = ThreadPoolExecutor(max_workers=config.direct_workers + config.proxy_workers)
+            direct_exec = ThreadPoolExecutor(max_workers=config.direct_workers)
+            proxy_exec = ThreadPoolExecutor(max_workers=config.proxy_workers)
             try:
-                for cand in batch:
-                    future = dl_exec.submit(download_worker, cand)
+                for cand in direct_batch:
+                    future = direct_exec.submit(download_worker, cand)
+                    all_futures[future] = cand
+                for cand in proxy_batch:
+                    future = proxy_exec.submit(download_worker, cand)
                     all_futures[future] = cand
 
-                # v10.4: 用 as_completed 逐个检查, 全局超时=300s
+                # v10.5: 全局超时=300s, 死线保护
                 for future in as_completed(all_futures, timeout=300):
                     if current + len(prefiltered) >= target:
                         for f in all_futures:
@@ -1871,7 +1874,8 @@ class ShipScraperV10:
                             self.failed_urls.add(cand.image_url)
                             f.cancel()
             finally:
-                dl_exec.shutdown(wait=False, cancel_futures=True)
+                direct_exec.shutdown(wait=False, cancel_futures=True)
+                proxy_exec.shutdown(wait=False, cancel_futures=True)
 
             print(f"  Batch {batch_idx}: {len(prefiltered)} passed prefilter (from {len(batch)} candidates)")
 
